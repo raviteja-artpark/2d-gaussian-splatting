@@ -272,10 +272,150 @@ class GaussianExtractor(object):
         
         # coloring the mesh
         torch.cuda.empty_cache()
-        mesh = mesh.as_open3d
+        o3d_mesh = o3d.geometry.TriangleMesh()
+        o3d_mesh.vertices = o3d.utility.Vector3dVector(mesh.vertices)
+        o3d_mesh.triangles = o3d.utility.Vector3iVector(mesh.faces)
+        if mesh.visual.vertex_colors is not None:
+            o3d_mesh.vertex_colors = o3d.utility.Vector3dVector(
+                mesh.visual.vertex_colors[:, :3] / 255.0
+            )
+        mesh = o3d_mesh
+        # mesh = mesh.as_open3d
         print("texturing mesh ... ")
         _, rgbs = compute_unbounded_tsdf(torch.tensor(np.asarray(mesh.vertices)).float().cuda(), inv_contraction=None, voxel_size=voxel_size, return_rgb=True)
         mesh.vertex_colors = o3d.utility.Vector3dVector(rgbs.cpu().numpy())
+        return mesh
+
+    @torch.no_grad()
+    def extract_mesh_nvblox(self, voxel_size=0.02, max_integration_distance=5.0, mask_background=True, use_skimage_mc=False):
+        """
+        Perform TSDF fusion using nvblox GPU-accelerated backend.
+
+        voxel_size: the voxel size of the volume (meters)
+        max_integration_distance: maximum depth range to integrate (meters)
+        mask_background: whether to mask background, only works when the dataset has masks
+        use_skimage_mc: if True, extract dense TSDF grid and run scikit-image marching cubes
+                        instead of nvblox's built-in block-by-block mesh extraction
+
+        return o3d.mesh
+        """
+        import tempfile
+        from nvblox_torch.mapper import Mapper
+        from nvblox_torch.mapper_params import MapperParams, ProjectiveIntegratorParams
+
+        print("Running nvblox GPU TSDF integration ...")
+        print(f'voxel_size: {voxel_size}')
+        print(f'max_integration_distance: {max_integration_distance}')
+
+        # Configure nvblox mapper
+        projective_integrator_params = ProjectiveIntegratorParams()
+        projective_integrator_params.projective_integrator_max_integration_distance_m = max_integration_distance
+
+        mapper_params = MapperParams()
+        mapper_params.set_projective_integrator_params(projective_integrator_params)
+
+        mapper = Mapper(
+            voxel_sizes_m=voxel_size,
+            mapper_parameters=mapper_params,
+        )
+
+        _ALIGN = 8  # nvblox requires dimensions divisible by 8
+
+        for i, viewpoint_cam in tqdm(enumerate(self.viewpoint_stack), desc="nvblox TSDF integration"):
+            rgb = self.rgbmaps[i]
+            depth = self.depthmaps[i]
+
+            # Apply background mask if available
+            if mask_background and (viewpoint_cam.gt_alpha_mask is not None):
+                depth = depth.clone()
+                depth[(viewpoint_cam.gt_alpha_mask.cpu() < 0.5)] = 0
+
+            # Extract intrinsics (same math as to_cam_open3d)
+            W = viewpoint_cam.image_width
+            H = viewpoint_cam.image_height
+            ndc2pix = torch.tensor([
+                [W / 2, 0, 0, (W-1) / 2],
+                [0, H / 2, 0, (H-1) / 2],
+                [0, 0, 0, 1]]).float().cuda().T
+            intrins = (viewpoint_cam.projection_matrix @ ndc2pix)[:3,:3].T
+            intrinsics = torch.tensor([
+                [intrins[0,0].item(), 0.0, intrins[0,2].item()],
+                [0.0, intrins[1,1].item(), intrins[1,2].item()],
+                [0.0, 0.0, 1.0],
+            ], dtype=torch.float32)
+
+            # Camera-to-world pose (nvblox expects c2w)
+            w2c = viewpoint_cam.world_view_transform.T  # [4, 4]
+            pose = torch.inverse(w2c).cpu().float()
+
+            # Depth: [1, H, W] -> [H, W] float32 on CUDA
+            depth_gpu = depth.squeeze(0).cuda().float().contiguous()
+
+            # Color: [3, H, W] -> [H, W, 3] uint8 on CUDA
+            color_gpu = (rgb.permute(1, 2, 0).clamp(0.0, 1.0) * 255).to(torch.uint8).cuda().contiguous()
+
+            # Ensure dimensions are divisible by 8
+            h, w = depth_gpu.shape
+            new_h = (h // _ALIGN) * _ALIGN
+            new_w = (w // _ALIGN) * _ALIGN
+            if new_h != h or new_w != w:
+                depth_gpu = depth_gpu[:new_h, :new_w].contiguous()
+                color_gpu = color_gpu[:new_h, :new_w].contiguous()
+
+            mapper.add_depth_frame(depth_gpu, pose, intrinsics)
+            mapper.add_color_frame(color_gpu, pose, intrinsics)
+
+        if use_skimage_mc:
+            # Extract dense TSDF grid and run scikit-image marching cubes
+            from nvblox_torch.layer import convert_layer_to_dense_tensor
+            from skimage.measure import marching_cubes
+            import numpy as np
+
+            print("Extracting dense TSDF grid from nvblox ...")
+            tsdf_layer = mapper.tsdf_layer_view(mapper_id=0)
+            tsdf_grid, voxel_centers = convert_layer_to_dense_tensor(
+                tsdf_layer, unobserved_value=1.0
+            )
+
+            total_voxels = tsdf_grid.shape[0] * tsdf_grid.shape[1] * tsdf_grid.shape[2]
+            print(f"Dense TSDF grid shape: {tsdf_grid.shape[:3]}, total voxels: {total_voxels:,}")
+            if total_voxels > 500_000_000:
+                print("WARNING: Very large grid, may require significant memory")
+
+            tsdf_np = tsdf_grid.squeeze(-1).cpu().numpy()
+            voxel_size_m = tsdf_layer.voxel_size()
+
+            print("Running scikit-image marching cubes ...")
+            verts, faces, normals, _ = marching_cubes(
+                volume=tsdf_np,
+                level=0.0,
+                spacing=(voxel_size_m, voxel_size_m, voxel_size_m),
+            )
+
+            # Transform vertices from grid space to world coordinates
+            grid_origin = voxel_centers[0, 0, 0].cpu().numpy()
+            verts = verts + grid_origin
+
+            mesh = o3d.geometry.TriangleMesh()
+            mesh.vertices = o3d.utility.Vector3dVector(verts)
+            mesh.triangles = o3d.utility.Vector3iVector(faces)
+            mesh.vertex_normals = o3d.utility.Vector3dVector(normals)
+        else:
+            # Original nvblox block-by-block mesh extraction
+            print("Extracting mesh from nvblox ...")
+            mapper.update_color_mesh()
+            color_mesh = mapper.get_color_mesh()
+
+            # Save to temp file, reload as Open3D mesh for consistent return type
+            with tempfile.NamedTemporaryFile(suffix='.ply', delete=False) as tmp:
+                tmp_path = tmp.name
+            color_mesh.save(tmp_path)
+            mesh = o3d.io.read_triangle_mesh(tmp_path)
+            os.remove(tmp_path)
+
+            if not mesh.has_vertex_normals():
+                mesh.compute_vertex_normals()
+
         return mesh
 
     @torch.no_grad()
