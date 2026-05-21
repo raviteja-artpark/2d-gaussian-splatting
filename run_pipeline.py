@@ -9,9 +9,13 @@ Stages:
   1. scripts/lidar_to_depth_maps_cuda.py -- LAS -> per-frame depth maps
   2. custom_train.py                     -- 2DGS training
   3. render.py                           -- TSDF fusion -> fuse.ply + fuse_post.ply
+                                            (+ per-view renders/gt PNGs if the
+                                             YAML config has skip_train: false)
 
 Extra flags after --dataset_root are forwarded to custom_train.py only.
-TSDF / mesh parameters live under mesh.render_2dgs in the YAML.
+TSDF / mesh parameters -- including skip_train / skip_test / skip_mesh --
+live under mesh.render_2dgs in the YAML and drive render.py via its
+--config defaults.
 """
 import argparse
 import subprocess
@@ -32,9 +36,12 @@ def main():
          "--config", args.config, "--dataset_root", args.dataset_root],
         [sys.executable, str(HERE / "custom_train.py"),
          "--config", args.config, "--dataset_root", args.dataset_root, *extra],
+        # skip_train / skip_test / skip_mesh are driven by mesh.render_2dgs
+        # in the YAML so the user can flip them once and have all downstream
+        # invocations honour the new default. Avoid hardcoding them as CLI
+        # flags here — argparse store_true would otherwise override the YAML.
         [sys.executable, str(HERE / "render.py"),
-         "--config", args.config, "--dataset_root", args.dataset_root,
-         "--skip_train", "--skip_test"],
+         "--config", args.config, "--dataset_root", args.dataset_root],
     ]
     for stage in stages:
         print(f"\n>>> {' '.join(stage)}", flush=True)

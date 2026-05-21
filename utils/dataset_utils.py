@@ -1,5 +1,7 @@
 """Dataset preparation helpers shared by train.py and custom_train.py."""
 
+import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -117,7 +119,17 @@ def prepare_xgrids_dataset(xgrids_path):
             dst.unlink()
         elif dst.exists():
             return
-        dst.symlink_to(src)
+        # Prefer symlink; fall back to hardlink, then copy. The ntfs3 driver
+        # supports symlinks unreliably (works for some files, fails with
+        # ENOENT for others on the same volume), so we need a fallback for
+        # datasets that live on NTFS mounts.
+        try:
+            dst.symlink_to(src)
+        except OSError:
+            try:
+                os.link(src, dst)
+            except OSError:
+                shutil.copy2(src, dst)
 
     # Symlink images preserving subdirectory structure (camera_0/, camera_1/)
     for img_path in image_files:

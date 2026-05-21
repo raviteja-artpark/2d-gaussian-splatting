@@ -20,10 +20,12 @@
 # LiDAR preprocessing step too, use run_training_with_lidar_preprocess.py.
 #
 
+import datetime
 import os
 import sys
 import argparse
 from argparse import Namespace
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from random import randint
 
@@ -38,6 +40,7 @@ from utils.general_utils import safe_state, get_expon_lr_func, build_rotation
 from utils.dataset_utils import find_las_file, prepare_xgrids_dataset, resolve_dataset_root
 from utils.custom_loss import compute_depth_loss, compute_normal_loss
 from utils.direct_geometric_supervision import LiDARSurfaceField
+from utils.render_utils import save_img_u8
 
 from gaussian_renderer import render, network_gui
 from scene import Scene, GaussianModel
@@ -198,6 +201,122 @@ def _apply_phase_b_lrs(optimizer, soft: bool, xyz_lr: float):
 
 
 # =============================================================================
+# Initial-Gaussian seeding helpers
+# =============================================================================
+
+def _build_las_init_basic_pcd(las_path: Path, voxel_size: float):
+    """Load merged .las, voxel-downsample, return a BasicPointCloud
+    (xyz + RGB in [0,1] + zero normals) suitable for create_from_pcd()."""
+    import laspy
+    import open3d as o3d
+    from utils.graphics_utils import BasicPointCloud
+
+    las = laspy.read(str(las_path))
+    xyz = np.vstack([las.x, las.y, las.z]).T.astype(np.float64)
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    if "red" in las.point_format.dimension_names:
+        rgb = (np.vstack([las.red, las.green, las.blue])
+               .T.astype(np.float64) / 65535.0)
+        pcd.colors = o3d.utility.Vector3dVector(rgb)
+    down = pcd.voxel_down_sample(voxel_size)
+    points = np.asarray(down.points)
+    colors = (np.asarray(down.colors) if down.has_colors()
+              else np.full_like(points, 0.5))
+    return BasicPointCloud(points=points, colors=colors,
+                           normals=np.zeros_like(points))
+
+
+# =============================================================================
+# Mid-training render snapshots
+# =============================================================================
+
+def _phase_tag(iteration: int, densify_until_iter: int, ct_cfg) -> str:
+    """Compact tag describing the training regime active at this iteration.
+
+    The tag is used as part of the folder name for a snapshot so a glance at
+    the on-disk layout tells you what losses were active when each render
+    was taken.
+    """
+    in_phase_b = iteration >= int(ct_cfg["phase_b_start"])
+    if in_phase_b:
+        return "phaseB-softDGS" if bool(ct_cfg["soft_phase_b"]) else "phaseB-frozenDGS"
+    # Phase A — sub-buckets by which extra terms have kicked in.
+    if iteration >= int(ct_cfg["dgs_start_iter"]):
+        return "phaseA-DGSon-densifyOff"
+    if iteration > 7000:
+        return "phaseA-densifyOn-fullRegs"
+    if iteration > 3000:
+        return "phaseA-densifyOn-distortion"
+    return "phaseA-densifyOn-warmup"
+
+
+def _write_run_schedule_readme(parent_dir: Path, opt, ct_cfg, n_train_cams: int):
+    """Drop a schedule.txt at the parent folder describing this run's regime
+    boundaries, so the subfolder tags are self-documenting."""
+    densify_until = int(opt.densify_until_iter)
+    phase_b_start = int(ct_cfg["phase_b_start"])
+    dgs_start = int(ct_cfg["dgs_start_iter"])
+    iterations = int(opt.iterations)
+    soft = bool(ct_cfg["soft_phase_b"])
+    every = int(ct_cfg.get("render_progress_every", 0))
+
+    lines = [
+        f"Run started:        {datetime.datetime.now().isoformat(timespec='seconds')}",
+        f"Total iterations:   {iterations}",
+        f"Training views:     {n_train_cams}",
+        f"Snapshot interval:  {every} iters",
+        "",
+        "Regime boundaries (matches phase tags in subfolder names):",
+        f"  iter <= 3000               -> phaseA-densifyOn-warmup      (RGB + LiDAR depth/normal + LiDAR DGS off)",
+        f"  iter 3001..7000            -> phaseA-densifyOn-distortion  (+ distortion regulariser)",
+        f"  iter 7001..{densify_until:<5}            -> phaseA-densifyOn-fullRegs    (+ normal regulariser)",
+        f"  iter {densify_until+1}..{phase_b_start:<5}      -> phaseA-DGSon-densifyOff     (densify ends; DGS surface field begins; LiDAR depth/normal still active)",
+        f"  iter {phase_b_start+1}..{iterations:<5}      -> phaseB-{'softDGS' if soft else 'frozenDGS':<10} (xyz LR clamped; LiDAR depth/normal off; DGS continues{' softly' if soft else ' (frozen pos)'})",
+        "",
+        "Hyperparameters",
+        f"  lambda_dssim          = {opt.lambda_dssim}",
+        f"  lambda_normal         = {opt.lambda_normal}",
+        f"  lambda_dist           = {opt.lambda_dist}",
+        f"  lambda_depth          = {ct_cfg['lambda_depth']}",
+        f"  lambda_lidar_normal   = {ct_cfg['lambda_lidar_normal']}",
+        f"  lambda_dgs            = {ct_cfg['lambda_dgs']} (phase A), {ct_cfg['phase_b_dgs_lambda']} (phase B)",
+        f"  lambda_dgs_normal     = {ct_cfg['lambda_dgs_normal']}",
+        f"  densify_grad_threshold= {opt.densify_grad_threshold}",
+        f"  densification_interval= {opt.densification_interval}",
+        f"  opacity_cull          = {opt.opacity_cull}",
+        f"  opacity_reset_interval= {opt.opacity_reset_interval}",
+        f"  position_lr_init      = {opt.position_lr_init}",
+        f"  phase_b_xyz_lr        = {ct_cfg['phase_b_xyz_lr']}",
+        f"  soft_phase_b          = {soft}",
+        f"  phase_b_keep_image_losses = {bool(ct_cfg.get('phase_b_keep_image_losses', False))}",
+    ]
+    (parent_dir / "schedule.txt").write_text("\n".join(lines) + "\n")
+
+
+@torch.no_grad()
+def _render_progress_snapshot(parent_dir: Path, iteration: int, phase_tag: str,
+                              train_cams, gaussians, pipe, background,
+                              max_workers: int = 8) -> None:
+    """Render every training camera at the current model state, save PNGs in
+    parallel under <parent_dir>/iter_NNNNN_<phase_tag>/.
+
+    GPU renders are serial (single CUDA stream); PNG encoding is dispatched to
+    a thread pool that runs concurrently with the next render."""
+    snap_dir = parent_dir / f"iter_{iteration:05d}_{phase_tag}"
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    # We render in deterministic order so file index == train-cam index.
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for idx, cam in enumerate(train_cams):
+            result = render(cam, gaussians, pipe, background)
+            img = torch.clamp(result["render"], 0.0, 1.0)
+            img_np = img.permute(1, 2, 0).contiguous().cpu().numpy()
+            pool.submit(save_img_u8, img_np,
+                        str(snap_dir / f"{idx:05d}.png"))
+        # ThreadPoolExecutor.__exit__ blocks until all submitted writes finish.
+
+
+# =============================================================================
 # Output folder / TB setup (mirrors train.py.prepare_output_and_logger)
 # =============================================================================
 
@@ -225,6 +344,54 @@ def training(dataset, opt, pipe, ct_cfg, dataset_root,
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+
+    # --- Optional alternative initial-Gaussian seeding ----------------------
+    # Scene(dataset, gaussians) has already populated `gaussians` via the
+    # default COLMAP-points3D path. If the YAML asks for a different
+    # source, overwrite that initial population before training begins.
+    init_source = str(ct_cfg.get("init_source", "colmap")).lower()
+    if init_source == "colmap":
+        pass  # default; Scene already seeded from points3D
+    elif init_source == "las":
+        pcd = _build_las_init_basic_pcd(
+            las_path=find_las_file(
+                str(Path(dataset_root).expanduser().resolve())),
+            voxel_size=float(ct_cfg.get("init_las_voxel_size", 0.05)),
+        )
+        print(f"[custom_train] init_source=las: seeding {len(pcd.points):,} "
+              f"Gaussians from voxel-downsampled LAS "
+              f"(voxel_size={ct_cfg.get('init_las_voxel_size', 0.05)} m)")
+        gaussians.create_from_pcd(pcd, scene.cameras_extent)
+        gaussians.training_setup(opt)  # re-wire optimizer to new params
+    elif init_source == "concat_per_capture":
+        # Default path matches what run_full_pipeline.py writes via
+        # merge_splats.py: <dataset_root>/init_concat_per_capture.ply
+        ply_path = (ct_cfg.get("init_concat_per_capture_ply")
+                    or str(Path(dataset_root).expanduser().resolve()
+                           / "init_concat_per_capture.ply"))
+        if not Path(ply_path).exists():
+            sys.exit(
+                f"[custom_train] init_source=concat_per_capture but "
+                f"{ply_path} not found. Run run_full_pipeline.py with this "
+                f"init_source set in the YAML (it builds the PLY via "
+                f"merge_splats.py between stages 1 and 2), or build the PLY "
+                f"manually with `python -m perception_super_app.apps.map_merge.merge_splats`."
+            )
+        print(f"[custom_train] init_source=concat_per_capture: loading "
+              f"bootstrap PLY {ply_path}")
+        gaussians.load_ply(ply_path)
+        gaussians.training_setup(opt)  # re-wire optimizer to loaded params
+        gaussians.spatial_lr_scale = scene.cameras_extent
+        # training_setup resizes xyz_gradient_accum / denom but not
+        # max_radii2D, so the densification block would index a stale
+        # 7742-element tensor with a 3M-element mask. Resize explicitly.
+        gaussians.max_radii2D = torch.zeros(
+            gaussians.get_xyz.shape[0], device="cuda")
+        print(f"[custom_train] bootstrap loaded "
+              f"{gaussians.get_xyz.shape[0]:,} Gaussians")
+    else:
+        sys.exit(f"[custom_train] Unknown init_source: {init_source!r} "
+                 f"(expected one of: colmap, las, concat_per_capture)")
 
     first_iter = 0
     if checkpoint:
@@ -258,6 +425,18 @@ def training(dataset, opt, pipe, ct_cfg, dataset_root,
         f"dgs_start_iter ({dgs_start_iter}) must equal densify_until_iter "
         f"({opt.densify_until_iter}). Enabling DGS during densification "
         f"causes scene explosion (see project_dgs.pdf Section 7.5).")
+
+    # --- Mid-training render snapshots: parent dir + schedule.txt -----------
+    render_progress_every = int(ct_cfg.get("render_progress_every", 0))
+    progress_parent = None
+    if render_progress_every > 0:
+        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        progress_parent = Path(dataset.model_path) / f"training_renders_{ts}"
+        progress_parent.mkdir(parents=True, exist_ok=True)
+        _write_run_schedule_readme(progress_parent, opt, ct_cfg,
+                                   len(scene.getTrainCameras()))
+        print(f"[custom_train] Mid-training renders every "
+              f"{render_progress_every} iters -> {progress_parent}")
 
     # --- Attach LiDAR maps to cameras ---------------------------------------
     dm_path = Path(dataset.source_path) / "depth_maps_lidar"
@@ -474,6 +653,23 @@ def training(dataset, opt, pipe, ct_cfg, dataset_root,
                 print(f"\n[ITER {iteration}] Saving Checkpoint")
                 torch.save((gaussians.capture(), iteration),
                            scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+            # --- Mid-training render snapshot ----------------------------
+            # Render every training view to disk at the current model state.
+            # Lands in training_renders_<ts>/iter_NNNNN_<phase_tag>/.
+            if (progress_parent is not None
+                    and iteration > 0
+                    and iteration % render_progress_every == 0):
+                tag = _phase_tag(iteration, opt.densify_until_iter, ct_cfg)
+                progress_bar.write(
+                    f"[ITER {iteration}] Rendering progress snapshot "
+                    f"({tag}) -> {progress_parent.name}/iter_{iteration:05d}_{tag}"
+                )
+                _render_progress_snapshot(
+                    progress_parent, iteration, tag,
+                    train_cams=scene.getTrainCameras(),
+                    gaussians=gaussians, pipe=pipe, background=background,
+                )
 
 
 # =============================================================================
